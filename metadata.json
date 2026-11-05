@@ -1,0 +1,6 @@
+{
+  "name": "First Slice NYC — A New York Story",
+  "description": "A cozy, golden-hour lowpoly 3D life-sim web game in New York City built with Three.js, featuring fluid character movement, dynamic camera tracking, and open-block exploration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
