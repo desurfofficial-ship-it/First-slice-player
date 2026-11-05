@@ -95,4 +95,31 @@ describe('Player fluid movement & kinematics', () => {
     const turned = lerpAngle(-3.0, 3.0, 0.5);
     expect(Math.abs(turned)).toBeGreaterThan(3.0);
   });
+
+  it('accelerates smoothly on ladder and aligns to rungs', () => {
+    const ground = boxFromCenter(0, -0.5, 0, 100, 1, 100);
+    const player = new Player([ground]);
+    player.ladder = {
+      area: boxFromCenter(10, 2.5, -7.5, 2, 5, 2),
+      top: 5.0,
+    };
+    player.capsule.x = 9.2;
+    player.capsule.y = 1.0;
+    player.capsule.z = -7.0;
+
+    // First frame of climb up
+    player.update(DT, { x: 0, y: 1 });
+    expect(player.vy).toBeGreaterThan(0);
+    expect(player.capsule.y).toBeGreaterThan(1.0);
+    // Should approach center x = 10
+    expect(player.capsule.x).toBeGreaterThan(9.2);
+
+    // Multi-frame climb: builds toward target climb speed
+    for (let i = 0; i < 10; i++) {
+      player.update(DT, { x: 0, y: 1 });
+    }
+    expect(player.vy).toBeGreaterThan(2.0);
+    expect(player.capsule.y).toBeGreaterThan(1.2);
+  });
 });
+

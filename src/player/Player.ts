@@ -61,15 +61,19 @@ export class Player {
       const rightX = -Math.cos(this.camYaw);
       const rightZ = Math.sin(this.camYaw);
       const lateral = inputX * SPEED * 0.8;
-      this.vy = inputY * CLIMB_SPEED;
-      if (inputY !== 0.0) {
-        const c = this.ladder === null ? { x: this.capsule.x, z: this.capsule.z } : ladderCenter(this.ladder);
-        this.capsule.x = approach(this.capsule.x, c.x, dt * 2.0);
-        this.capsule.z = approach(this.capsule.z, c.z + 0.55, dt * 2.0);
-      }
+      
+      // Smooth kinematic vertical acceleration & rung cadence
+      const targetVy = inputY * CLIMB_SPEED;
+      this.vy += (targetVy - this.vy) * Math.min(1, dt * 14.0);
+
+      // Responsive center alignment to ladder rungs (snappy yet smooth)
+      const c = this.ladder === null ? { x: this.capsule.x, z: this.capsule.z } : ladderCenter(this.ladder);
+      this.capsule.x = approach(this.capsule.x, c.x, dt * 4.5);
+      this.capsule.z = approach(this.capsule.z, c.z + 0.55, dt * 4.5);
+
       this.capsule.x += rightX * lateral * dt;
       this.capsule.z += rightZ * lateral * dt;
-      this.rotationY = lerpAngle(this.rotationY, Math.PI, Math.min(1, dt * 10.0));
+      this.rotationY = lerpAngle(this.rotationY, Math.PI, Math.min(1, dt * 12.0));
       depenetrate(this.boxes, this.capsule, STEP_UP);
       const prevY = this.capsule.y;
       this.capsule.y += this.vy * dt;

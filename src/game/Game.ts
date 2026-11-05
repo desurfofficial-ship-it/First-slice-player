@@ -199,6 +199,12 @@ export class Game {
     this.renderer.toneMappingExposure = 1.05;
     container.appendChild(this.renderer.domElement);
 
+    // ABO furniture (docs/57): the KTX2/meshopt decoders need the renderer
+    // for the transcoder's format probe — wired here, once, and the
+    // interior slots fetch their models. Missing files keep the procedural
+    // rooms (the docs/28 seam law — the game never depends on its assets).
+    this.world.configureGltfDecoders(this.renderer);
+
     // ---------------- systems ----------------
     this.player = new Player(this.world.colliders);
     this.cam = new GameCamera(window.innerWidth / window.innerHeight, this.world.colliders, this.world.canopySpheres());
@@ -1436,8 +1442,24 @@ export class Game {
     if (persist) writeSave({ ...loadSave(), starter: st.id });
   }
 
-  setStarter(id: string): void {
+  setStarter(id: string, force = false): void {
+    const save = loadSave();
+    // Character selection lock: once a character is chosen, it cannot be changed mid-game
+    if (save.starter && save.starter !== id && !force) {
+      console.warn(`[Game] Character is locked to '${save.starter}' for this playthrough. Start a new game to change characters.`);
+      return;
+    }
     this.applyStarter(id, true);
+  }
+
+  /** Start a fresh playthrough (resets block progress to Day 1 with optional starter selection) */
+  startNewGame(newStarterId?: string): void {
+    const clean = defaultSave();
+    if (newStarterId && isStarterId(newStarterId)) {
+      clean.starter = newStarterId;
+    }
+    writeSave(clean);
+    location.reload();
   }
 
   setCameraPreset(mode: 'cozy' | 'street' | 'vista' | 'topdown'): void {

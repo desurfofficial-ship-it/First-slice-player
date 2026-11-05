@@ -385,22 +385,39 @@ export function updatePersonAnim(
   const t = rig.time;
 
   if (rig.mode === 'climb') {
-    // arms reach up the rails, legs pedal slowly, body hugs the ladder
-    rig.phase += dt * 3.4;
+    // Upgraded athletic climb: alternating rung reaches, natural knee bends,
+    // rhythmic torso weight-shifts, and upward head focus toward the rungs.
+    const climbRate = Math.max(3.2, 2.4 + rig.smoothSpeed * 1.5);
+    rig.phase += dt * climbRate;
     const swing = Math.sin(rig.phase);
-    rig.armL.rotation.x = -2.75 + swing * 0.18;
-    rig.armR.rotation.x = -2.75 - swing * 0.18;
-    rig.armL.rotation.z = 0.12;
-    rig.armR.rotation.z = -0.12;
-    rig.hipL.rotation.x = swing * 0.34;
-    rig.hipR.rotation.x = -swing * 0.34;
-    rig.root.position.y = 0;
-    rig.root.rotation.x = 0;
+    const cosSwing = Math.cos(rig.phase);
+
+    // Dynamic hand-over-hand reaches (strictly < -2.4 for contract compliance)
+    rig.armL.rotation.x = -2.72 + swing * 0.22;
+    rig.armR.rotation.x = -2.72 - swing * 0.22;
+    rig.armL.rotation.z = 0.15 + swing * 0.04;
+    rig.armR.rotation.z = -0.15 + swing * 0.04;
+    rig.armL.rotation.y = -0.12;
+    rig.armR.rotation.y = 0.12;
+
+    // Fluid leg pedaling with bent knees resting onto the rungs
+    rig.hipL.rotation.x = 0.15 + swing * 0.38;
+    rig.hipR.rotation.x = 0.15 - swing * 0.38;
+    rig.hipL.rotation.z = 0.06;
+    rig.hipR.rotation.z = -0.06;
+
+    // Weight shift toward active gripping arm and subtle vertical cadence bounce
+    rig.body.rotation.z = swing * 0.05;
+    rig.body.rotation.x = 0;
+    rig.root.position.x = swing * 0.025;
+    rig.root.position.y = Math.abs(cosSwing) * 0.03;
+    rig.root.rotation.x = 0; // Sacred contract: no forward lean on vertical rungs
     rig.root.rotation.z = 0;
     rig.bank = 0;
-    rig.body.rotation.x = 0;
-    rig.body.rotation.z = 0;
-    rig.head.rotation.y = 0;
+
+    // Head naturally tilts up to watch the next rungs
+    rig.head.rotation.x = -0.22;
+    rig.head.rotation.y = swing * 0.04;
     return;
   }
 

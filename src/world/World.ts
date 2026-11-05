@@ -8,6 +8,8 @@
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js';
+import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { PAL } from '../core/palette';
 import { ITEM_LABELS } from '../core/content';
@@ -31,6 +33,7 @@ import { MatBank, makeTree, makeTreePit, makeStreetlight, makeTrashCan, makeRecy
 import { drawIntoAtlas, atlasMaterial, atlasTexture } from './signAtlas';
 import { PigeonFlock, Squirrel, seededRng } from './ambient';
 import { fuseFlatParts } from './vertexFuse';
+import { FURNITURE_SLOTS, type FurnitureSlot } from './furniture';
 import { makeUtilityPole, makeSpanWires, makePoleSign, makePlanter, makeFireEscapeDeco, makeTrafficSignal } from './streetAssets';
 import { LeafDrift } from './leaves';
 import { Pedestrians, type PedLook, type RoadRect, type RoutineStop } from './peds';
@@ -38,7 +41,8 @@ import { buildSubwaySystem, STATION, ZONE_KEEP_RE, type SubwaySystem, type Colli
 import { buildTimesSquare, type TimesSquare } from './timesSquare';
 import { buildArrivalBus, BUS04_RECT, playerOccupiesBus04, type ArrivalBus } from './arrivalBus';
 import { ambientWindowPlan, barrierDiary, flyerSlipForDay, hallNoticeForDay,
-  skylineWindowMask, skylineDiaryIndices, skylineDiaryWarmth, SKYLINE_WARMTH } from './dressing';
+  skylineWindowMask, skylineDiaryIndices, skylineDiaryWarmth, SKYLINE_WARMTH,
+  STREET_PLAN, PEDESTRIAN_ROLES, type StreetPlan } from './dressing';
 import { D4_LAUNDRY_SIGN, D4_NOTICE_TITLE, D4_NOTICE_LINES, D4_RECEIPT_TEXT,
   RECORD_SIGN_TOP, RECORD_SIGN_SUB } from '../core/content';
 // the half-court upgrade (docs/48/49) — basketball-owned module, the one
@@ -268,6 +272,20 @@ export class World {
   private leaves!: LeafDrift;
   private peds: Pedestrians;
   private ambientTime = 0;
+  // ---- the street schedule (M4, world/dressing STREET_PLAN) ----
+  /** The dusk flag this World last saw — null until the first update, so
+   *  the day plan applies exactly once at boot. The lever stays Game's
+   *  (the dusk flag); the schedule table stays dressing's; World only
+   *  applies the row on the edge. */
+  private streetPhaseDusk: boolean | null = null;
+  /** The applied plan's cab multiplier — updateTaxi reads it every frame
+   *  (one multiply, hot-path cold). */
+  private cabPaceNow = 1;
+  /** The applied plan — probes read this (the schedule's wiring, provable
+   *  without sampling). */
+  streetPlanNow(): StreetPlan {
+    return STREET_PLAN[this.streetPhaseDusk ? 'dusk' : 'day'];
+  }
 
   /** Read-only XZ of every ambient walker (diagnostics + probes). */
   pedBodies(): Array<{ x: number; z: number }> {
@@ -461,6 +479,13 @@ export class World {
   private glbLoader: GLTFLoader | null = new GLTFLoader();
   /** Which props ended up wearing a generated .glb, and from which file. */
   readonly glbUpgrades = new Map<string, string>();
+  /** ABO furniture (docs/57): which slots ended up wearing a real model,
+   *  and from which file — the probe's evidence map. */
+  readonly furnitureUpgrades = new Map<string, string>();
+  /** The renderer-backed loader (KTX2 transcoder + meshopt decoder) is
+   *  configured once the Game owns its renderer; furniture upgrades fire
+   *  from that call. Until then the street-seam loader loads plain GLBs. */
+  private furnitureWired = false;
 
   constructor() {
     const scene = this.scene;
@@ -929,15 +954,25 @@ export class World {
     // the cart's body blocks — you lean on the counter, you don't stand in it
     this.cartCollider = boxFromCenter(4, 1.0, -6.6, 2.2, 2.0, 1.4);
     this.colliders.push(this.cartCollider);
-    this.rosaCollider = boxFromCenter(-27, 0.85, 6.8, 0.56, 1.7, 0.56);
-    this.idrisCollider = boxFromCenter(-2, 0.85, -4.6, 0.56, 1.7, 0.56);
-    this.kidCollider = boxFromCenter(15, 0.7, 6.35, 0.5, 1.4, 0.5);
-    this.customerCollider = boxFromCenter(0, -999.5, 0, 0.56, 1.7, 0.56);
+    // Every person collider rides the chain-link lens law (seeThroughCamera):
+    // bodies stop bodies, lenses don't stop on bodies (docs/51 B18 — the
+    // step-off spawn sits inside the Shuffle lanes; a walker loitering
+    // behind it pulled the handover snap to the truncation floor, ~1.3 m,
+    // burying the lens in the player's own hair at the game's first
+    // playable frame). The same read protects every cast beat: a body
+    // crossing the boom sweeps a foreground silhouette instead of yanking
+    // the camera. syncPersonCollider mutates only the bounds — the flag
+    // rides the same object forever.
+    const person = (b: AABB): AABB => { b.seeThroughCamera = true; return b; };
+    this.rosaCollider = person(boxFromCenter(-27, 0.85, 6.8, 0.56, 1.7, 0.56));
+    this.idrisCollider = person(boxFromCenter(-2, 0.85, -4.6, 0.56, 1.7, 0.56));
+    this.kidCollider = person(boxFromCenter(15, 0.7, 6.35, 0.5, 1.4, 0.5));
+    this.customerCollider = person(boxFromCenter(0, -999.5, 0, 0.56, 1.7, 0.56));
     // stranger/Sal/familiar — parked underground until their beats make them
     // visible (the customer's trick); updateDynamics syncs them with the cast
-    this.strangerCollider = boxFromCenter(0, -999.5, 0, 0.56, 1.7, 0.56);
-    this.salCollider = boxFromCenter(-7, 0.85, 7.85, 0.56, 1.7, 0.56);
-    this.familiarCollider = boxFromCenter(0, -999.5, 0, 0.56, 1.7, 0.56);
+    this.strangerCollider = person(boxFromCenter(0, -999.5, 0, 0.56, 1.7, 0.56));
+    this.salCollider = person(boxFromCenter(-7, 0.85, 7.85, 0.56, 1.7, 0.56));
+    this.familiarCollider = person(boxFromCenter(0, -999.5, 0, 0.56, 1.7, 0.56));
     this.colliders.push(this.rosaCollider, this.idrisCollider, this.kidCollider, this.customerCollider,
       this.strangerCollider, this.salCollider, this.familiarCollider);
 
@@ -1521,6 +1556,15 @@ export class World {
       { jacket: 0x54628f, pants: 0x2f333b, skin: 0xe8b08e, hair: 0x5a4632, style: 'bun', shoe: 0x3a3028, scale: 0.93 },
       { jacket: 0x8a5a48, pants: 0x3a3540, skin: 0xc98e5a, hair: 0x241f28, style: 'flat', shoe: 0x2e2a33, scale: 1.0 },
       { jacket: 0x4f6b5e, pants: 0x33383f, skin: 0xe8b08e, hair: 0x1a1a22, style: 'bun', shoe: 0x4a3428, scale: 0.96 },
+      // M4 — THE DUSK SHIFT (world/dressing STREET_PLAN): three more
+      // neighbors whose shift is the evening rush — home while the sun is
+      // up (hidden: zero draw calls at rest, the dressing cost law), out
+      // when the subway draws. Same articulated rig, bank-shared materials,
+      // loops on the shipped north-walk band — the rush thickens the crowd
+      // the Shuffle teach already owns, it does not pave new lanes.
+      { jacket: 0x6e4f3a, pants: 0x32363e, skin: 0xd9a06b, hair: 0x2b2730, style: 'cap', shoe: 0x3a3028, scale: 1.04 },
+      { jacket: 0x715671, pants: 0x3b3f4a, skin: 0x8a5a3b, hair: 0x14141c, style: 'bun', shoe: 0x33291f, scale: 0.94 },
+      { jacket: 0x4a5a6e, pants: 0x443f4a, skin: 0xe8b08e, hair: 0x3a2c22, style: 'flat', shoe: 0x2e2a33, scale: 1.06 },
     ];
     const pedPaths: Array<Array<[number, number]>> = [
       // the commuter: full block, crossing only at the crosswalk (x ≈ -6.5,
@@ -1568,6 +1612,15 @@ export class World {
       [[-26, 6.14], [-36.5, 6.14], [-36.5, 6.68], [-26, 6.68]], // the stair local
       [[-22.5, 6.08], [-39.5, 6.08], [-39.5, 6.76], [-22.5, 6.76]], // the west commuter
       [[-20, 6.16], [-28.5, 6.16], [-28.5, 6.66], [-20, 6.66]], // the bodega local
+      // M4 — the dusk shift's lanes (out only for the evening rush): three
+      // more rectangles on the SAME proven north-walk band (z 6.05–6.8, the
+      // bodega→plaza stretch, no street crossings, so the spawn law —
+      // pts[0] reachable legally from every point — holds trivially). Lanes
+      // offset from the four shipped ones so seven bodies interleave with
+      // gaps to walk toward, never a wall.
+      [[-21.5, 6.28], [-40, 6.28], [-40, 6.6], [-21.5, 6.6]],    // the rush weaver
+      [[-23.5, 6.24], [-36, 6.24], [-36, 6.72], [-23.5, 6.72]],  // the bench local
+      [[-27, 6.3], [-38.5, 6.3], [-38.5, 6.58], [-27, 6.58]],    // the stair weaver
     ];
     // ---- their routines (Phase 4, Doc 37 §3E): the day's small beats ------
     // Every trigger sits OFF the walk lanes (at the building line or the
@@ -1638,6 +1691,18 @@ export class World {
       ],
       [
         { x: -18.8, z: 6.9, faceTo: [-18.5, 7.55], dwell: 3.0 }, // the bodega's warm window
+      ],
+      // M4 — the dusk shift's beats: the evening errands (the bus bench,
+      // the bulletin board, the bodega window), all off the walk lanes at
+      // the building line, same law as every routine above.
+      [
+        { x: -24.2, z: 7.0, faceTo: [-23.3, 7.62], dwell: 4.0 }, // waits by the bus stop
+      ],
+      [
+        { x: -33.4, z: 6.95, faceTo: [-37.6, 7.5], dwell: 3.0 }, // the bulletin board, from the west
+      ],
+      [
+        { x: -19.1, z: 6.95, faceTo: [-18.5, 7.55], dwell: 3.5 }, // one more glance at the bodega
       ],
     ];
     this.peds = new Pedestrians(
@@ -1713,6 +1778,9 @@ export class World {
         { xMin: -76, xMax: -68, zMin: -64, zMax: 64 }, // Juniper Avenue
         { xMin: 68, xMax: 76, zMin: -64, zMax: 64 },   // Sycamore Avenue
       ] as RoadRect[],
+      // M4: each walker's shift on the street schedule — the dusk shift
+      // boots home (the game boots into the day phase)
+      PEDESTRIAN_ROLES,
     );
     // the walkers carry real bodies for the player's collision stack — the
     // audit's "NPCs walking through the player" (doc 35 §1): one synced AABB
@@ -2721,6 +2789,23 @@ export class World {
     // kitchenette (NE corner)
     this.fixture(g, 'Hall_Kitchenette', -49.4, 0.45, 30.6, 2.4, 0.9, 1.6, PAL.teal);
     this.colliders.push(boxFromCenter(-49.4, 0.45, 30.6, 2.4, 0.9, 1.6));
+    // ABO furniture slots (docs/57) — the living-room half: sofa + coffee
+    // table on the E wall's clear zone, a real bookcase beside the shelves,
+    // two real chairs at the work table. Colliders authored here; the GLB
+    // swap is visual-only (the rooms never depend on the files).
+    this.fixture(g, 'Hall_Sofa', -48.75, 0.44, 26.0, 0.9, 0.88, 1.9, PAL.teal);
+    this.colliders.push(boxFromCenter(-48.75, 0.44, 26.0, 0.9, 0.88, 1.9));
+    this.fixture(g, 'Hall_CoffeeTable', -50.2, 0.225, 26.0, 1.1, 0.45, 0.6, 0x8e6f66);
+    this.colliders.push(boxFromCenter(-50.2, 0.225, 26.0, 1.1, 0.45, 0.6));
+    this.fixture(g, 'Hall_Bookcase', -50.9, 0.9, 31.3, 1.0, 1.8, 0.35, PAL.bldg2);
+    this.colliders.push(boxFromCenter(-50.9, 0.9, 31.3, 1.0, 1.8, 0.35));
+    this.fixture(g, 'Hall_Chair_A', -53.1, 0.44, 28.5, 0.5, 0.88, 0.5, 0x2b2730);
+    this.colliders.push(boxFromCenter(-53.1, 0.44, 28.5, 0.5, 0.88, 0.5));
+    this.fixture(g, 'Hall_Chair_B', -54.9, 0.44, 28.5, 0.5, 0.88, 0.5, 0x2b2730);
+    this.colliders.push(boxFromCenter(-54.9, 0.44, 28.5, 0.5, 0.88, 0.5));
+    // the sideboard against the S wall, east of the notice wall
+    this.fixture(g, 'Hall_Sideboard', -51.2, 0.51, 20.75, 1.4, 1.02, 0.5, 0x8e6f66);
+    this.colliders.push(boxFromCenter(-51.2, 0.51, 20.75, 1.4, 1.02, 0.5));
 
     // the hall's tall windows: single warm translucent panes, always on —
     // lit from the street, see-through up close (the swap-free pane)
@@ -2770,23 +2855,29 @@ export class World {
     floor.position.set(55, 0.13, -14);
     floor.receiveShadow = true;
     g.add(floor);
-    // counter bar (E wall) + 8 stools
-    this.fixture(g, 'Diner_CounterBar', 58.9, 0.55, -14.5, 0.7, 1.1, 8, PAL.teal);
-    this.fixture(g, 'Diner_CounterTop', 58.9, 1.12, -14.5, 0.8, 0.06, 8.1, PAL.stone);
-    this.colliders.push(boxFromCenter(58.9, 0.55, -14.5, 0.7, 1.1, 8));
+    // counter bar (E wall) + 8 stools. docs/57 re-lay: the W5 build put the
+    // cook line BETWEEN the aisle and the bar (x 57.6) with the stools in
+    // the 0.15 m slot at 58.35 — buried, first as cylinders and then as the
+    // ABO stool models (docs/57's probe caught it). The line now reads
+    // aisle → stools → bar → cook line → E wall; same pieces, same
+    // colliders' sizes, positions only.
+    this.fixture(g, 'Diner_CounterBar', 57.6, 0.55, -14.5, 0.7, 1.1, 8, PAL.teal);
+    this.fixture(g, 'Diner_CounterTop', 57.6, 1.12, -14.5, 0.8, 0.06, 8.1, PAL.stone);
+    this.colliders.push(boxFromCenter(57.6, 0.55, -14.5, 0.7, 1.1, 8));
     for (let i = 0; i < 8; i++) {
       const sz = -10.9 - i * 1.03;
       const stool = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.55, 8), this.bank.get(PAL.cream));
-      stool.position.set(58.35, 0.28, sz);
+      stool.name = `Diner_Stool_${i}`; // ABO furniture slot (docs/57)
+      stool.position.set(56.95, 0.28, sz);
       stool.castShadow = true;
       g.add(stool);
     }
-    // kitchen line behind the counter
-    this.fixture(g, 'Diner_Kitchen', 57.6, 0.5, -14.5, 1.6, 1.0, 8, 0x9a938c);
+    // kitchen line behind the counter (east of the bar, facing it)
+    this.fixture(g, 'Diner_Kitchen', 58.9, 0.5, -14.5, 1.6, 1.0, 8, 0x9a938c);
     const griddle = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.08, 2.2), this.roomWarmMat);
-    griddle.position.set(57.6, 1.04, -13.2);
+    griddle.position.set(58.9, 1.04, -13.2);
     g.add(griddle);
-    this.colliders.push(boxFromCenter(57.6, 0.5, -14.5, 1.6, 1.0, 8));
+    this.colliders.push(boxFromCenter(58.9, 0.5, -14.5, 1.6, 1.0, 8));
     // booths (4, W wall)
     for (const bz of [-11.5, -14, -16.5, -18.5]) {
       this.fixture(g, `Diner_BoothT_${bz}`, 51.6, 0.72, bz, 0.8, 0.06, 1.1, PAL.cream);
@@ -2885,10 +2976,22 @@ export class World {
     // the Map's corkboard (by the door)
     this.fixture(g, 'Cecil_Corkboard', 11.2, 9.5, -9.42, 1.1, 0.8, 0.06, 0x8e6f66);
     this.fixture(g, 'Cecil_CorkNote', 11.2, 9.5, -9.38, 0.5, 0.6, 0.02, PAL.cream);
+    // ABO furniture slots (docs/57) — the authored placeholders the real
+    // models wear at boot (manifest: src/world/furniture.ts). Colliders are
+    // authored here; the swap is visual-only, the room never depends on
+    // the files.
+    this.fixture(g, 'Cecil_Dresser', 10.55, 8.875, -13.2, 0.55, 0.95, 1.1, 0x8e6f66);
+    this.colliders.push(boxFromCenter(10.55, 8.875, -13.2, 0.55, 0.95, 1.1));
+    this.fixture(g, 'Cecil_Nightstand', 15.55, 8.675, -10.6, 0.4, 0.55, 0.45, 0x8e6f66);
+    this.colliders.push(boxFromCenter(15.55, 8.675, -10.6, 0.4, 0.55, 0.45));
+    // the lamp rides the dresser's top — its placeholder stands on it
+    this.fixture(g, 'Cecil_Lamp', 10.62, 9.46, -13.35, 0.16, 0.22, 0.16, 0x2b2730);
     // rug
     const rug = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.02, 1.4), this.bank.get(PAL.teal));
+    rug.name = 'Cecil_Rug';
     rug.position.set(12.6, 8.41, -11.0);
     rug.receiveShadow = true;
+    rug.castShadow = true;
     g.add(rug);
     // the window's warm translucent pane (always visible — lit from inside)
     this.scene.add(this.facadePane('Cecil_Glass', 'x', -8.03, 14.32, 15.48, 9.37, 10.73, this.roomGlassMat));
@@ -3494,6 +3597,120 @@ export class World {
         for (const m of mats) m?.dispose();
       }
     });
+  }
+
+  // ------------------------------------------------- ABO furniture seam
+  // docs/57: the curated Amazon Berkeley Objects pack (CC-BY-4.0) wears the
+  // interiors. The models are the dataset's lod1 GLBs — meshopt-compressed
+  // geometry with KTX2 (basis) textures — so the loader needs the renderer
+  // for the transcoder's format probe; the Game wires it once the renderer
+  // exists. The seam law is the docs/28 one: a missing or malformed file
+  // keeps the authored placeholder, one console.info line, no retry loop,
+  // and NOTHING gameplay-bearing changes (colliders, toggles, anchors).
+
+  /** Called once by the Game after the renderer exists: re-arms the GLB
+   *  loader with the meshopt + KTX2 decoders and fires the furniture
+   *  upgrades. Street-prop upgrades keep their earlier plain loader. */
+  configureGltfDecoders(renderer: THREE.WebGLRenderer): void {
+    if (this.furnitureWired) return;
+    this.furnitureWired = true;
+    const loader = new GLTFLoader();
+    loader.setMeshoptDecoder(MeshoptDecoder);
+    const ktx2 = new KTX2Loader()
+      .setTranscoderPath('vendor/basis/')
+      .detectSupport(renderer);
+    loader.setKTX2Loader(ktx2);
+    this.glbLoader = loader;
+    for (const slot of FURNITURE_SLOTS) void this.upgradeFurnitureWithGLB(slot);
+  }
+
+  /** One furniture slot: swap the named placeholder inside its room group
+   *  for the real model, scaled to the slot's authored height (or footprint
+   *  for flat pieces), XZ-centered on the placeholder, feet on its ground.
+   *  Siblings in `hide` lose visibility ONLY once the model is in — the
+   *  procedural room stays whole when the file is missing. */
+  async upgradeFurnitureWithGLB(slot: FurnitureSlot): Promise<boolean> {
+    const loader = this.glbLoader;
+    if (!loader) return false;
+    const room = this.scene.children.find((c) => c.name === `INT_${slot.room}`);
+    const placeholder = room?.children.find((c) => c.name === slot.fixture);
+    if (!room || !placeholder) {
+      console.info(`[furniture] ${slot.id}: placeholder ${slot.fixture} not found — kept procedural`);
+      return false;
+    }
+    const file = `models/furniture/${slot.id}.glb`;
+    const url = new URL(file, document.baseURI).href;
+    try {
+      const gltf = await loader.loadAsync(url);
+      let visual: THREE.Object3D = gltf.scene;
+      let hasMesh = false;
+      const stray: THREE.Object3D[] = [];
+      visual.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) hasMesh = true;
+        if ((o as THREE.Light).isLight || (o as THREE.Camera).isCamera) stray.push(o);
+      });
+      if (!hasMesh) throw new Error('no meshes in file');
+      for (const o of stray) o.parent?.remove(o);
+      // the slot's yaw goes on FIRST and the merge bakes it into the
+      // vertices — the bounds below are the occupied ones, so the footprint
+      // guard judges the piece as placed, not as authored
+      visual.rotation.y = slot.rotateY ?? 0;
+      visual.updateWorldMatrix(true, true);
+      // one draw per material (the street seam's merge; furniture files are
+      // single-mesh so this usually returns the scene untouched)
+      visual = this.mergeGltfParts(visual);
+
+      placeholder.updateWorldMatrix(true, false);
+      const phBox = new THREE.Box3().setFromObject(placeholder);
+      const phSize = phBox.getSize(new THREE.Vector3());
+      const box = new THREE.Box3().setFromObject(visual);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      if (!(size.y > 0) || !Number.isFinite(size.y)) throw new Error('degenerate bounds');
+      const worldPos = placeholder.getWorldPosition(new THREE.Vector3());
+
+      // fit law: 'height' scales the model to the slot's authored height;
+      // 'footprint' (flat pieces) covers the placeholder's XZ box. The
+      // footprint guard is the street seam's band (0.5–1.9×) — a mislabeled
+      // model (a lamp wearing the bed slot) bails whole, room keeps its box.
+      const s = slot.fitBy === 'footprint'
+        ? Math.min(phSize.x / size.x, phSize.z / size.z)
+        : slot.height / size.y;
+      const scaledX = size.x * s, scaledZ = size.z * s;
+      if (scaledX < phSize.x * 0.5 || scaledX > phSize.x * 1.9
+        || scaledZ < phSize.z * 0.5 || scaledZ > phSize.z * 1.9) {
+        throw new Error(`footprint mismatch (${scaledX.toFixed(2)}×${scaledZ.toFixed(2)} vs ${phSize.x.toFixed(2)}×${phSize.z.toFixed(2)})`);
+      }
+      if (slot.fitBy === 'footprint' && !(Math.abs(size.y * s - slot.height) < slot.height * 4 + 0.15)) {
+        throw new Error(`flat piece reads ${(size.y * s).toFixed(2)} m thick`);
+      }
+
+      const wrapper = new THREE.Group();
+      wrapper.name = `${slot.fixture}_glb`;
+      wrapper.position.set(worldPos.x, phBox.min.y, worldPos.z);
+      visual.position.set(-center.x, -box.min.y, -center.z);
+      visual.scale.setScalar(s);
+      wrapper.add(visual);
+      wrapper.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) { o.castShadow = true; o.receiveShadow = true; }
+      });
+
+      const parent = placeholder.parent;
+      if (!parent) throw new Error('placeholder was removed from the scene');
+      parent.add(wrapper);
+      parent.remove(placeholder);
+      this.disposeTree(placeholder);
+      for (const name of slot.hide ?? []) {
+        const sibling = parent.children.find((c) => c.name === name);
+        if (sibling) sibling.visible = false;
+      }
+      this.furnitureUpgrades.set(`${slot.room}:${slot.fixture}`, file);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.info(`[furniture] ${slot.id} keeps its procedural look (${msg})`);
+      return false;
+    }
   }
 
   private makeMailbox(x: number, z: number): THREE.Group {
@@ -5638,6 +5855,16 @@ export class World {
    * Dynamics-before-player fixes the ordering with no gameplay change.
    */
   updateDynamics(dt: number, player?: { x: number; y: number; z: number }, extra?: Array<{ x: number; z: number }>, dusk = false): void {
+    // the street schedule's edge (M4): apply the phase's row once per flip —
+    // the dusk shift comes on, the park's tender heads home, the cab's pace
+    // follows the table. Ambient reads no story state: the dusk flag is the
+    // same lever the M121's night park and the court pair already use.
+    if (dusk !== this.streetPhaseDusk) {
+      this.streetPhaseDusk = dusk;
+      const plan = STREET_PLAN[dusk ? 'dusk' : 'day'];
+      this.peds.applyStreetPlan(plan);
+      this.cabPaceNow = plan.cabPace;
+    }
     // the persistent cast owns a body each — no more ghosting through Rosa,
     // Idris, or the kid (playtest 2026-10-30: "passed through the npc and rosa")
     this.syncPersonCollider(this.rosaCollider, this.rosa);
@@ -5934,7 +6161,7 @@ export class World {
     // XW-COURT and both junction boxes from the one shared list. Commit law
     // unchanged: once the nose has reached the zone's line the cab goes —
     // a lurch stop inside the paint is its own hazard.
-    let speed: number = CAB.cruise;
+    let speed: number = CAB.cruise * this.cabPaceNow; // the schedule's pace — rush crawls
     for (const zone of KESTREL_COURTESY_ZONES) {
       let occupied = !!(player && player.x > zone.xMin && player.x < zone.xMax
         && player.z > World.COURTESY_Z.zMin && player.z < World.COURTESY_Z.zMax);
